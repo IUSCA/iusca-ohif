@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useImageViewer } from '@ohif/ui-next';
 import { useSystem, utils } from '@ohif/core';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { useViewportGrid, StudyBrowser, Separator } from '@ohif/ui-next';
 import { PanelStudyBrowserHeader } from './PanelStudyBrowserHeader';
 import { defaultActionIcons } from './constants';
@@ -28,6 +28,8 @@ function PanelStudyBrowser({
   const { servicesManager, commandsManager, extensionManager } = useSystem();
   const { displaySetService, customizationService } = servicesManager.services;
   const navigate = useNavigate();
+  const { search } = useLocation();
+  const primaryStudyOnly = new URLSearchParams(search).get('primaryStudyOnly') === 'true';
   const studyMode =
     (customizationService.getCustomization('studyBrowser.studyMode') as string) || 'all';
 
@@ -47,13 +49,252 @@ function PanelStudyBrowser({
   const [displaySets, setDisplaySets] = useState([]);
   const [displaySetsLoadingState, setDisplaySetsLoadingState] = useState({});
   const [thumbnailImageSrcMap, setThumbnailImageSrcMap] = useState({});
+  const [lazyPreviewUnavailable, setLazyPreviewUnavailable] = useState({});
+  const [lazyCatalogDisplaySets, setLazyCatalogDisplaySets] = useState([]);
   const [jumpToDisplaySet, setJumpToDisplaySet] = useState(null);
+  const [visibleThumbnailDisplaySetInstanceUIDs, setVisibleThumbnailDisplaySetInstanceUIDs] =
+    useState([]);
+  const thumbnailLoadQueueRef = useRef([]);
+  const thumbnailLoadInFlightRef = useRef(0);
+  const thumbnailLoadRequestedRef = useRef(new Set());
+  const thumbnailCacheOrderRef = useRef([]);
+  const visibleThumbnailIdsRef = useRef(new Set());
+
+  const virtualizeThumbnails =
+    typeof window !== 'undefined' &&
+    window.localStorage.getItem('cfndap_ohif_virtual_sidebar') === '1';
+  const virtualizeThumbnailsRef = useRef(virtualizeThumbnails);
+  virtualizeThumbnailsRef.current = virtualizeThumbnails;
+
+  const lazySeriesMetadataEnabled =
+    typeof window !== 'undefined' &&
+    window.localStorage.getItem('cfndap_ohif_lazy_series_metadata') === '1';
 
   const [viewPresets, setViewPresets] = useState(
     customizationService.getCustomization('studyBrowser.viewPresets')
   );
 
   const [actionIcons, setActionIcons] = useState(defaultActionIcons);
+
+  const refreshLazyCatalog = useCallback(() => {
+    const lazyMetadataApi = (window as any).__CFNDAP_OHIF_LAZY_SERIES_METADATA__;
+    if (!lazySeriesMetadataEnabled || !lazyMetadataApi?.enabled?.()) {
+      setLazyCatalogDisplaySets([]);
+      return;
+    }
+
+    setLazyCatalogDisplaySets(
+      lazyMetadataApi.getCatalog().map(series => {
+        const displaySetInstanceUID = `cfndap-lazy:${series.seriesInstanceUID}`;
+        return {
+          displaySetInstanceUID,
+          SeriesInstanceUID: series.seriesInstanceUID,
+          StudyInstanceUID: series.studyInstanceUID,
+          SeriesNumber: series.seriesNumber,
+          SeriesDescription: series.seriesDescription || '',
+          Modality: series.modality,
+          description: series.seriesDescription || '',
+          seriesNumber: series.seriesNumber,
+          modality: series.modality,
+          componentType: 'thumbnail',
+          numInstances: Number(series.instanceCount) || 0,
+          imageSrc: thumbnailImageSrcMap[displaySetInstanceUID],
+          isLazyMetadataPlaceholder: true,
+          isLazyMetadataLoading: series.hydrating,
+          isLazyPreviewUnavailable: lazyPreviewUnavailable[displaySetInstanceUID] === true,
+        };
+      })
+    );
+  }, [lazyPreviewUnavailable, lazySeriesMetadataEnabled, thumbnailImageSrcMap]);
+
+  const mergeLazyCatalogDisplaySets = useCallback(
+    mappedDisplaySets => {
+      if (!lazySeriesMetadataEnabled) {
+        return mappedDisplaySets;
+      }
+
+      const hydratedSeriesUIDs = new Set(
+        mappedDisplaySets.map(displaySet => displaySet.SeriesInstanceUID)
+      );
+      return [
+        ...mappedDisplaySets,
+        ...lazyCatalogDisplaySets.filter(
+          displaySet => !hydratedSeriesUIDs.has(displaySet.SeriesInstanceUID)
+        ),
+      ];
+    },
+    [lazyCatalogDisplaySets, lazySeriesMetadataEnabled]
+  );
+
+  useEffect(() => {
+    if (!lazySeriesMetadataEnabled) {
+      return;
+    }
+
+    window.addEventListener('cfndap:series-metadata-catalog-ready', refreshLazyCatalog);
+    window.addEventListener('cfndap:series-metadata-hydration-started', refreshLazyCatalog);
+    window.addEventListener('cfndap:series-metadata-hydrated', refreshLazyCatalog);
+    window.addEventListener('cfndap:series-metadata-hydration-failed', refreshLazyCatalog);
+    refreshLazyCatalog();
+
+    return () => {
+      window.removeEventListener('cfndap:series-metadata-catalog-ready', refreshLazyCatalog);
+      window.removeEventListener('cfndap:series-metadata-hydration-started', refreshLazyCatalog);
+      window.removeEventListener('cfndap:series-metadata-hydrated', refreshLazyCatalog);
+      window.removeEventListener('cfndap:series-metadata-hydration-failed', refreshLazyCatalog);
+    };
+  }, [lazySeriesMetadataEnabled, refreshLazyCatalog]);
+
+  const storeThumbnailImageSrc = useCallback((displaySetInstanceUID, thumbnailSrc) => {
+    const maxThumbnailImageSrcEntries = 96;
+    const order = thumbnailCacheOrderRef.current.filter(id => id !== displaySetInstanceUID);
+    order.push(displaySetInstanceUID);
+
+    setThumbnailImageSrcMap(previous => {
+      const next = { ...previous, [displaySetInstanceUID]: thumbnailSrc };
+      while (order.length > maxThumbnailImageSrcEntries) {
+        delete next[order.shift()];
+      }
+      return next;
+    });
+
+    thumbnailCacheOrderRef.current = order;
+  }, []);
+
+  const markLazyPreviewUnavailable = useCallback(displaySetInstanceUID => {
+    setLazyPreviewUnavailable(previous => {
+      if (previous[displaySetInstanceUID]) {
+        return previous;
+      }
+      return { ...previous, [displaySetInstanceUID]: true };
+    });
+  }, []);
+
+  const loadThumbnail = useCallback(
+    async dSet => {
+      if (dSet.isLazyMetadataPlaceholder) {
+        const displaySetInstanceUID = dSet.displaySetInstanceUID;
+        if (thumbnailNoImageModalities.includes(dSet.Modality)) {
+          markLazyPreviewUnavailable(displaySetInstanceUID);
+          return;
+        }
+
+        let thumbnailSrc;
+        try {
+          thumbnailSrc = await dataSource.retrieve.series.thumbnail({
+            StudyInstanceUID: dSet.StudyInstanceUID,
+            SeriesInstanceUID: dSet.SeriesInstanceUID,
+            instanceCount: dSet.numInstances,
+          });
+        } catch {
+          // Some MR-labelled objects, such as Raw Data Storage, have no renderable pixels.
+          markLazyPreviewUnavailable(displaySetInstanceUID);
+          return;
+        }
+
+        if (
+          thumbnailSrc &&
+          (!virtualizeThumbnailsRef.current ||
+            visibleThumbnailIdsRef.current.has(displaySetInstanceUID))
+        ) {
+          storeThumbnailImageSrc(displaySetInstanceUID, thumbnailSrc);
+        }
+        return;
+      }
+      const displaySetInstanceUID = dSet.displaySetInstanceUID;
+      const displaySet = displaySetService.getDisplaySetByUID(displaySetInstanceUID);
+      if (displaySet?.unsupported) {
+        return;
+      }
+
+      const imageIds = dataSource.getImageIdsForDisplaySet(dSet);
+      const imageId = getImageIdForThumbnail(displaySet, imageIds);
+      let { thumbnailSrc } = displaySet;
+
+      if (!thumbnailSrc && displaySet.getThumbnailSrc) {
+        thumbnailSrc = await displaySet.getThumbnailSrc({ getImageSrc });
+      }
+      if (!thumbnailSrc && imageId) {
+        thumbnailSrc = await getImageSrc(imageId);
+        displaySet.thumbnailSrc = thumbnailSrc;
+      }
+
+      if (thumbnailSrc) {
+        if (
+          !virtualizeThumbnailsRef.current ||
+          visibleThumbnailIdsRef.current.has(displaySetInstanceUID)
+        ) {
+          storeThumbnailImageSrc(displaySetInstanceUID, thumbnailSrc);
+        }
+      }
+    },
+    [
+      dataSource,
+      displaySetService,
+      getImageSrc,
+      markLazyPreviewUnavailable,
+      storeThumbnailImageSrc,
+    ]
+  );
+
+  const scheduleThumbnailLoad = useCallback(
+    dSet => {
+      const displaySetInstanceUID = dSet.displaySetInstanceUID;
+      if (thumbnailLoadRequestedRef.current.has(displaySetInstanceUID)) {
+        return;
+      }
+
+      thumbnailLoadRequestedRef.current.add(displaySetInstanceUID);
+      thumbnailLoadQueueRef.current.push(dSet);
+
+      const startNext = () => {
+        while (thumbnailLoadInFlightRef.current < 3 && thumbnailLoadQueueRef.current.length) {
+          const queuedDisplaySet = thumbnailLoadQueueRef.current.shift();
+          if (
+            virtualizeThumbnailsRef.current &&
+            !visibleThumbnailIdsRef.current.has(queuedDisplaySet.displaySetInstanceUID)
+          ) {
+            thumbnailLoadRequestedRef.current.delete(queuedDisplaySet.displaySetInstanceUID);
+            continue;
+          }
+          thumbnailLoadInFlightRef.current += 1;
+          loadThumbnail(queuedDisplaySet)
+            .catch(error => {
+              thumbnailLoadRequestedRef.current.delete(queuedDisplaySet.displaySetInstanceUID);
+              console.warn('Unable to load Study Browser thumbnail', error);
+            })
+            .finally(() => {
+              thumbnailLoadInFlightRef.current -= 1;
+              startNext();
+            });
+        }
+      };
+
+      startNext();
+    },
+    [loadThumbnail]
+  );
+
+  const onVisibleThumbnailIdsChange = useCallback(
+    displaySetInstanceUIDs => {
+      visibleThumbnailIdsRef.current = new Set(displaySetInstanceUIDs);
+      setVisibleThumbnailDisplaySetInstanceUIDs(previous => {
+        if (
+          previous.length === displaySetInstanceUIDs.length &&
+          previous.every((id, index) => id === displaySetInstanceUIDs[index])
+        ) {
+          return previous;
+        }
+        return displaySetInstanceUIDs;
+      });
+
+      displaySetInstanceUIDs
+        .map(id => displaySets.find(displaySet => displaySet.displaySetInstanceUID === id))
+        .filter(displaySet => displaySet?.isLazyMetadataPlaceholder)
+        .forEach(scheduleThumbnailLoad);
+    },
+    [displaySets, scheduleThumbnailLoad]
+  );
 
   // multiple can be true or false
   const updateActionIconValue = actionIcon => {
@@ -76,7 +317,7 @@ function PanelStudyBrowser({
 
   const mapDisplaySetsWithState = customMapDisplaySets || _mapDisplaySets;
 
-  const onDoubleClickThumbnailHandler = useCallback(
+  const runDoubleClickThumbnailHandler = useCallback(
     async displaySetInstanceUID => {
       const customHandler = customizationService.getCustomization(
         'studyBrowser.thumbnailDoubleClickCallback'
@@ -106,6 +347,34 @@ function PanelStudyBrowser({
     ]
   );
 
+  const onDoubleClickThumbnailHandler = useCallback(
+    async displaySetInstanceUID => {
+      if (!displaySetInstanceUID.startsWith('cfndap-lazy:')) {
+        return runDoubleClickThumbnailHandler(displaySetInstanceUID);
+      }
+
+      const seriesInstanceUID = displaySetInstanceUID.replace('cfndap-lazy:', '');
+      await (window as any).__CFNDAP_OHIF_LAZY_SERIES_METADATA__?.hydrateSeries(seriesInstanceUID);
+
+      const hydratedDisplaySet = displaySetService
+        .getActiveDisplaySets()
+        .find(displaySet => displaySet.SeriesInstanceUID === seriesInstanceUID);
+      if (hydratedDisplaySet) {
+        await runDoubleClickThumbnailHandler(hydratedDisplaySet.displaySetInstanceUID);
+      }
+    },
+    [displaySetService, runDoubleClickThumbnailHandler]
+  );
+
+  const onClickThumbnailHandler = useCallback(async displaySetInstanceUID => {
+    if (!displaySetInstanceUID.startsWith('cfndap-lazy:')) {
+      return;
+    }
+
+    const seriesInstanceUID = displaySetInstanceUID.replace('cfndap-lazy:', '');
+    await (window as any).__CFNDAP_OHIF_LAZY_SERIES_METADATA__?.hydrateSeries(seriesInstanceUID);
+  }, []);
+
   // ~~ studyDisplayList
   useEffect(() => {
     // Fetch all studies for the patient in each primary study
@@ -129,12 +398,13 @@ function PanelStudyBrowser({
 
       let qidoStudiesForPatient = qidoForStudyUID;
 
-      // try to fetch the prior studies based on the patientID if the
-      // server can respond.
-      try {
-        qidoStudiesForPatient = await getStudiesForPatientByMRN(qidoForStudyUID);
-      } catch (error) {
-        console.warn(error);
+      // Scoped launches must not query same-patient priors; the primary study is already resolved above.
+      if (!primaryStudyOnly) {
+        try {
+          qidoStudiesForPatient = await getStudiesForPatientByMRN(qidoForStudyUID);
+        } catch (error) {
+          console.warn(error);
+        }
       }
 
       const mappedStudies = _mapDataSourceStudies(qidoStudiesForPatient);
@@ -160,7 +430,7 @@ function PanelStudyBrowser({
     }
 
     StudyInstanceUIDs.forEach(sid => fetchStudiesForPatient(sid));
-  }, [StudyInstanceUIDs, dataSource, getStudiesForPatientByMRN, navigate]);
+  }, [StudyInstanceUIDs, dataSource, getStudiesForPatientByMRN, navigate, primaryStudyOnly]);
 
   // ~~ Initial Thumbnails
   useEffect(() => {
@@ -187,33 +457,20 @@ function PanelStudyBrowser({
       return;
     }
 
-    currentDisplaySets.forEach(async dSet => {
-      const newImageSrcEntry = {};
-      const displaySet = displaySetService.getDisplaySetByUID(dSet.displaySetInstanceUID);
-      const imageIds = dataSource.getImageIdsForDisplaySet(dSet);
-
-      const imageId = getImageIdForThumbnail(displaySet, imageIds);
-
-      // TODO: Is it okay that imageIds are not returned here for SR displaySets?
-      if (displaySet?.unsupported) {
-        return;
-      }
-      // When the image arrives, render it and store the result in the thumbnailImgSrcMap
-      let { thumbnailSrc } = displaySet;
-      if (!thumbnailSrc && displaySet.getThumbnailSrc) {
-        thumbnailSrc = await displaySet.getThumbnailSrc({ getImageSrc });
-      }
-      if (!thumbnailSrc && imageId) {
-        const thumbnailSrc = await getImageSrc(imageId);
-        displaySet.thumbnailSrc = thumbnailSrc;
-      }
-      newImageSrcEntry[dSet.displaySetInstanceUID] = thumbnailSrc;
-
-      setThumbnailImageSrcMap(prevState => {
-        return { ...prevState, ...newImageSrcEntry };
-      });
-    });
-  }, [displaySetService, dataSource, getImageSrc, activeViewportId, hasLoadedViewports]);
+    const visibleThumbnailIds = new Set(visibleThumbnailDisplaySetInstanceUIDs);
+    currentDisplaySets
+      .filter(
+        dSet => !virtualizeThumbnails || visibleThumbnailIds.has(dSet.displaySetInstanceUID)
+      )
+      .forEach(scheduleThumbnailLoad);
+  }, [
+    displaySetService,
+    activeViewportId,
+    hasLoadedViewports,
+    scheduleThumbnailLoad,
+    visibleThumbnailDisplaySetInstanceUIDs,
+    virtualizeThumbnails,
+  ]);
 
   // ~~ displaySets
   useEffect(() => {
@@ -234,13 +491,14 @@ function PanelStudyBrowser({
       sortStudyInstances(mappedDisplaySets);
     }
 
-    setDisplaySets(mappedDisplaySets);
+    setDisplaySets(mergeLazyCatalogDisplaySets(mappedDisplaySets));
   }, [
     displaySetService.activeDisplaySets,
     displaySetsLoadingState,
     viewports,
     thumbnailImageSrcMap,
     customMapDisplaySets,
+    mergeLazyCatalogDisplaySets,
   ]);
 
   // ~~ subscriptions --> displaySets
@@ -253,9 +511,8 @@ function PanelStudyBrowser({
           return;
         }
         const { displaySetsAdded, options } = data;
-        displaySetsAdded.forEach(async dSet => {
+        displaySetsAdded.forEach(dSet => {
           const displaySetInstanceUID = dSet.displaySetInstanceUID;
-          const newImageSrcEntry = {};
           const displaySet = displaySetService.getDisplaySetByUID(displaySetInstanceUID);
           if (displaySet?.unsupported) {
             return;
@@ -264,28 +521,12 @@ function PanelStudyBrowser({
             setJumpToDisplaySet(displaySetInstanceUID);
           }
 
-          const imageIds = dataSource.getImageIdsForDisplaySet(displaySet);
-          const imageId = getImageIdForThumbnail(displaySet, imageIds);
-
-          // TODO: Is it okay that imageIds are not returned here for SR displaysets?
-          if (!imageId) {
-            return;
+          if (
+            !virtualizeThumbnails ||
+            visibleThumbnailDisplaySetInstanceUIDs.includes(displaySetInstanceUID)
+          ) {
+            scheduleThumbnailLoad(dSet);
           }
-
-          // When the image arrives, render it and store the result in the thumbnailImgSrcMap
-          let { thumbnailSrc } = displaySet;
-          if (!thumbnailSrc && displaySet.getThumbnailSrc) {
-            thumbnailSrc = await displaySet.getThumbnailSrc({ getImageSrc });
-          }
-          if (!thumbnailSrc) {
-            thumbnailSrc = await getImageSrc(imageId);
-            displaySet.thumbnailSrc = thumbnailSrc;
-          }
-          newImageSrcEntry[displaySetInstanceUID] = thumbnailSrc;
-
-          setThumbnailImageSrcMap(prevState => {
-            return { ...prevState, ...newImageSrcEntry };
-          });
         });
       }
     );
@@ -293,7 +534,13 @@ function PanelStudyBrowser({
     return () => {
       SubscriptionDisplaySetsAdded.unsubscribe();
     };
-  }, [displaySetService, dataSource, getImageSrc, hasLoadedViewports]);
+  }, [
+    displaySetService,
+    hasLoadedViewports,
+    scheduleThumbnailLoad,
+    visibleThumbnailDisplaySetInstanceUIDs,
+    virtualizeThumbnails,
+  ]);
 
   useEffect(() => {
     // TODO: Will this always hold _all_ the displaySets we care about?
@@ -312,7 +559,7 @@ function PanelStudyBrowser({
           sortStudyInstances(mappedDisplaySets);
         }
 
-        setDisplaySets(mappedDisplaySets);
+        setDisplaySets(mergeLazyCatalogDisplaySets(mappedDisplaySets));
       }
     );
 
@@ -330,7 +577,7 @@ function PanelStudyBrowser({
           sortStudyInstances(mappedDisplaySets);
         }
 
-        setDisplaySets(mappedDisplaySets);
+        setDisplaySets(mergeLazyCatalogDisplaySets(mappedDisplaySets));
       }
     );
 
@@ -344,6 +591,7 @@ function PanelStudyBrowser({
     viewports,
     displaySetService,
     customMapDisplaySets,
+    mergeLazyCatalogDisplaySets,
   ]);
 
   const tabs = createStudyBrowserTabs(StudyInstanceUIDs, studyDisplayList, displaySets);
@@ -430,7 +678,7 @@ function PanelStudyBrowser({
           setActiveTabName(clickedTabName);
         }}
         onClickUntrack={onClickUntrack}
-        onClickThumbnail={() => {}}
+        onClickThumbnail={onClickThumbnailHandler}
         onDoubleClickThumbnail={onDoubleClickThumbnailHandler}
         activeDisplaySetInstanceUIDs={activeDisplaySetInstanceUIDs}
         showSettings={actionIcons.find(icon => icon.id === 'settings')?.value}
@@ -445,6 +693,8 @@ function PanelStudyBrowser({
           servicesManager,
           menuItemsKey: 'studyBrowser.studyMenuItems',
         })}
+        virtualizeThumbnails={virtualizeThumbnails}
+        onVisibleThumbnailIdsChange={onVisibleThumbnailIdsChange}
       />
     </>
   );
@@ -507,6 +757,9 @@ function _mapDisplaySets(displaySets, displaySetLoadingState, thumbnailImageSrcM
           // .. Any other data to pass
         },
         isHydratedForDerivedDisplaySet: ds.isHydrated,
+        isLazyMetadataPlaceholder: ds.isLazyMetadataPlaceholder,
+        isLazyMetadataLoading: ds.isLazyMetadataLoading,
+        isLazyPreviewUnavailable: ds.isLazyPreviewUnavailable,
       });
     });
 

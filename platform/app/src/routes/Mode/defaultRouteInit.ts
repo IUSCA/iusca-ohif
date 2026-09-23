@@ -4,6 +4,172 @@ import isSeriesFilterUsed from '../../utils/isSeriesFilterUsed';
 
 const { seriesSortCriteria, getSplitParam } = utils;
 
+const lazySeriesMetadataFlag = 'cfndap_ohif_lazy_series_metadata';
+const lazySeriesInitialLimitFlag = 'cfndap_ohif_lazy_series_initial_limit';
+
+function isLazySeriesMetadataEnabled() {
+  return (
+    typeof window !== 'undefined' &&
+    window.localStorage.getItem(lazySeriesMetadataFlag) === '1'
+  );
+}
+
+function getLazySeriesInitialLimit() {
+  const configuredLimit = Number.parseInt(
+    window.localStorage.getItem(lazySeriesInitialLimitFlag) || '1',
+    10
+  );
+  return Number.isSafeInteger(configuredLimit) && configuredLimit > 0 ? configuredLimit : 1;
+}
+
+function installLazySeriesMetadataRegistry() {
+  if (!isLazySeriesMetadataEnabled()) {
+    return null;
+  }
+
+  const seriesByUID = new Map();
+  const hydratedSeriesUIDs = new Set();
+  const hydratingSeriesUIDs = new Set();
+  const hydrationPromises = new Map();
+
+  const dispatchCatalogChange = eventName => {
+    window.dispatchEvent(new CustomEvent(eventName));
+  };
+
+  const markHydrated = promise => {
+    const seriesInstanceUID = promise.metadata?.SeriesInstanceUID;
+    if (seriesInstanceUID && !hydratedSeriesUIDs.has(seriesInstanceUID)) {
+      hydratedSeriesUIDs.add(seriesInstanceUID);
+      hydratingSeriesUIDs.delete(seriesInstanceUID);
+      window.dispatchEvent(
+        new CustomEvent('cfndap:series-metadata-hydrated', {
+          detail: {
+            seriesInstanceUID,
+          },
+        })
+      );
+    }
+  };
+
+  const hydrateSeries = async seriesInstanceUID => {
+    const entry = seriesByUID.get(seriesInstanceUID);
+    if (!entry) {
+      throw new Error(`No deferred metadata request is registered for series ${seriesInstanceUID}`);
+    }
+
+    if (hydratedSeriesUIDs.has(seriesInstanceUID)) {
+      return entry.promise.start();
+    }
+
+    if (hydrationPromises.has(seriesInstanceUID)) {
+      return hydrationPromises.get(seriesInstanceUID);
+    }
+
+    hydratingSeriesUIDs.add(seriesInstanceUID);
+    dispatchCatalogChange('cfndap:series-metadata-hydration-started');
+
+    const hydrationPromise = Promise.resolve(entry.promise.start())
+      .then(instances => {
+        markHydrated(entry.promise);
+        return instances;
+      })
+      .catch(error => {
+        hydratingSeriesUIDs.delete(seriesInstanceUID);
+        dispatchCatalogChange('cfndap:series-metadata-hydration-failed');
+        throw error;
+      });
+
+    hydrationPromises.set(seriesInstanceUID, hydrationPromise);
+    return hydrationPromise;
+  };
+
+  const api = {
+    enabled: () => true,
+    getCatalog: () =>
+      Array.from(seriesByUID.values()).map(({ studyInstanceUID, promise }) => ({
+        studyInstanceUID,
+        seriesInstanceUID: promise.metadata?.SeriesInstanceUID,
+        seriesNumber: promise.metadata?.SeriesNumber,
+        seriesDescription: promise.metadata?.SeriesDescription,
+        modality: promise.metadata?.Modality,
+        instanceCount: promise.metadata?.NumberOfSeriesRelatedInstances,
+        hydrated: hydratedSeriesUIDs.has(promise.metadata?.SeriesInstanceUID),
+        hydrating: hydratingSeriesUIDs.has(promise.metadata?.SeriesInstanceUID),
+      })),
+    hydrateSeries,
+    getSummary: () => ({
+      catalogSeriesCount: seriesByUID.size,
+      hydratedSeriesCount: hydratedSeriesUIDs.size,
+      pendingSeriesCount: seriesByUID.size - hydratedSeriesUIDs.size,
+    }),
+  };
+
+  (window as any).__CFNDAP_OHIF_LAZY_SERIES_METADATA__ = api;
+
+  return {
+    register(studyInstanceUID, promises) {
+      promises.forEach(promise => {
+        const seriesInstanceUID = promise.metadata?.SeriesInstanceUID;
+        if (seriesInstanceUID) {
+          seriesByUID.set(seriesInstanceUID, { studyInstanceUID, promise });
+        }
+      });
+      dispatchCatalogChange('cfndap:series-metadata-catalog-ready');
+    },
+    markHydrated,
+    hydrateSeries,
+  };
+}
+
+function installCfndapRuntimeInstrumentation({ servicesManager, primaryStudyUID }) {
+  const debugApi = (window as any).__CFNDAP_OHIF_DEBUG__;
+  if (!debugApi?.enabled?.()) {
+    return null;
+  }
+
+  const { displaySetService, cornerstoneCacheService } = servicesManager.services;
+
+  let timer;
+  const report = label => {
+    const displaySets = displaySetService?.getActiveDisplaySets?.() || [];
+    const study = primaryStudyUID ? DicomMetadataStore.getStudy(primaryStudyUID) : null;
+    const series = study?.series || [];
+    const metrics = {
+      metadataStudyCount: DicomMetadataStore.getStudyInstanceUIDs?.().length || 0,
+      metadataSeriesCount: series.length,
+      metadataInstanceCount: series.reduce(
+        (count, seriesMetadata) => count + (seriesMetadata?.instances?.length || 0),
+        0
+      ),
+      displaySetCount: displaySets.length,
+      thumbnailCount: displaySets.filter(displaySet => Boolean(displaySet?.thumbnailSrc)).length,
+      imageCacheBytes: cornerstoneCacheService?.getCacheSize?.() ?? null,
+      imageCacheFreeBytes: cornerstoneCacheService?.getCacheFreeSpace?.() ?? null,
+    };
+
+    // Keep only scalar values globally so diagnostics do not retain image or metadata objects.
+    (window as any).__CFNDAP_OHIF_RUNTIME__ = { lastSnapshot: metrics };
+    debugApi.snapshot(label, { runtime: metrics });
+  };
+  const scheduleReport = label => {
+    window.clearTimeout(timer);
+    timer = window.setTimeout(() => report(label), 500);
+  };
+  const displaySetSubscription = displaySetService?.subscribe?.(
+    displaySetService.EVENTS.DISPLAY_SETS_CHANGED,
+    () => scheduleReport('display-sets-updated')
+  );
+
+  scheduleReport('runtime-instrumentation-ready');
+  return {
+    scheduleReport,
+    unsubscribe: () => {
+      window.clearTimeout(timer);
+      displaySetSubscription?.unsubscribe?.();
+    },
+  };
+}
+
 /**
  * Initialize the route.
  *
@@ -25,6 +191,7 @@ export async function defaultRouteInit(
 ) {
   const { displaySetService, hangingProtocolService, uiNotificationService, customizationService } =
     servicesManager.services;
+  const lazySeriesMetadataRegistry = installLazySeriesMetadataRegistry();
   /**
    * Function to apply the hanging protocol when the minimum number of display sets were
    * received or all display sets retrieval were completed
@@ -56,6 +223,13 @@ export async function defaultRouteInit(
 
   const unsubscriptions = [];
   const issuedWarningSeries = [];
+  const runtimeInstrumentation = installCfndapRuntimeInstrumentation({
+    servicesManager,
+    primaryStudyUID: studyInstanceUIDs?.[0],
+  });
+  if (runtimeInstrumentation) {
+    unsubscriptions.push(runtimeInstrumentation.unsubscribe);
+  }
   const { unsubscribe: instanceAddedUnsubscribe } = DicomMetadataStore.subscribe(
     DicomMetadataStore.EVENTS.INSTANCES_ADDED,
     function ({ StudyInstanceUID, SeriesInstanceUID, madeInClient = false }) {
@@ -79,6 +253,7 @@ export async function defaultRouteInit(
       }
 
       displaySetService.makeDisplaySets(seriesMetadata.instances, { madeInClient });
+      runtimeInstrumentation?.scheduleReport('metadata-updated');
     }
   );
 
@@ -86,6 +261,9 @@ export async function defaultRouteInit(
 
   log.time(Enums.TimingEnum.STUDY_TO_DISPLAY_SETS);
   log.time(Enums.TimingEnum.STUDY_TO_FIRST_IMAGE);
+  (window as any).__CFNDAP_OHIF_DEBUG__?.markStudyLoadStart?.({
+    studyCount: studyInstanceUIDs?.length || 0,
+  });
 
   const allRetrieves = studyInstanceUIDs.map(StudyInstanceUID =>
     dataSource.retrieve.series.metadata({
@@ -123,29 +301,52 @@ export async function defaultRouteInit(
     const allPromises = [];
     const remainingPromises = [];
 
+    const startSeriesPromise = promise => {
+      const seriesInstanceUID = promise.metadata?.SeriesInstanceUID;
+      if (lazySeriesMetadataRegistry && seriesInstanceUID) {
+        return lazySeriesMetadataRegistry.hydrateSeries(seriesInstanceUID);
+      }
+
+      return promise.start();
+    };
+
     function startRemainingPromises(remainingPromises) {
+      if (lazySeriesMetadataRegistry) {
+        return;
+      }
       remainingPromises.forEach(p => p.forEach(p => p.start()));
     }
 
-    promises.forEach(promise => {
+    promises.forEach((promise, index) => {
       const retrieveSeriesMetadataPromise = promise.value;
       if (!Array.isArray(retrieveSeriesMetadataPromise)) {
         return;
       }
 
+      lazySeriesMetadataRegistry?.register(
+        studyInstanceUIDs[index],
+        retrieveSeriesMetadataPromise
+      );
+
       if (displaySetFromUrl) {
-        const requiredSeriesPromises = retrieveSeriesMetadataPromise.map(promise =>
-          promise.start()
-        );
+        const requiredSeriesPromises = retrieveSeriesMetadataPromise.map(startSeriesPromise);
         allPromises.push(Promise.allSettled(requiredSeriesPromises));
       } else {
         const { requiredSeries, remaining } = hangingProtocolService.filterSeriesRequiredForRun(
           hangingProtocolId,
           retrieveSeriesMetadataPromise
         );
-        const requiredSeriesPromises = requiredSeries.map(promise => promise.start());
+        // The opt-in stack experiment limits broad hanging-protocol requirements
+        // so that only the initial viewport series is hydrated at route startup.
+        const initialSeries = lazySeriesMetadataRegistry
+          ? requiredSeries.slice(0, getLazySeriesInitialLimit())
+          : requiredSeries;
+        const deferredRequiredSeries = lazySeriesMetadataRegistry
+          ? requiredSeries.slice(initialSeries.length)
+          : [];
+        const requiredSeriesPromises = initialSeries.map(startSeriesPromise);
         allPromises.push(Promise.allSettled(requiredSeriesPromises));
-        remainingPromises.push(remaining);
+        remainingPromises.push([...deferredRequiredSeries, ...remaining]);
       }
     });
 

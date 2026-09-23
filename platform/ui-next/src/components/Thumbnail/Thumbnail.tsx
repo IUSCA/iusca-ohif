@@ -26,6 +26,9 @@ const Thumbnail = ({
   thumbnailType,
   modality,
   viewPreset = 'thumbnails',
+  isLazyMetadataPlaceholder = false,
+  isLazyMetadataLoading = false,
+  isLazyPreviewUnavailable = false,
   isHydratedForDerivedDisplaySet = false,
   isTracked = false,
   canReject = false,
@@ -75,8 +78,22 @@ const Thumbnail = ({
                 className="h-[114px] w-[128px] rounded object-contain"
                 crossOrigin="anonymous"
               />
+            ) : isLazyMetadataPlaceholder ? (
+              <div className="bg-background flex h-[114px] w-[128px] items-center justify-center rounded p-3 text-center text-[11px] text-muted-foreground whitespace-pre-line">
+                {isLazyMetadataLoading
+                  ? 'Loading series...'
+                  : isLazyPreviewUnavailable
+                    ? 'Preview unavailable\nClick to load series'
+                    : 'Click to load series'}
+              </div>
             ) : (
               <div className="bg-background h-[114px] w-[128px] rounded"></div>
+            )}
+
+            {isLazyMetadataPlaceholder && imageSrc && (
+              <div className="bg-background/80 absolute top-0 left-0 rounded-br px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                {isLazyMetadataLoading ? 'Loading series...' : 'Preview - click to load'}
+              </div>
             )}
 
             {/* bottom left */}
@@ -323,6 +340,9 @@ Thumbnail.propTypes = {
   viewPreset: PropTypes.string,
   modality: PropTypes.string,
   isHydratedForDerivedDisplaySet: PropTypes.bool,
+  isLazyMetadataPlaceholder: PropTypes.bool,
+  isLazyMetadataLoading: PropTypes.bool,
+  isLazyPreviewUnavailable: PropTypes.bool,
   isTracked: PropTypes.bool,
   onClickUntrack: PropTypes.func,
   countIcon: PropTypes.string,
